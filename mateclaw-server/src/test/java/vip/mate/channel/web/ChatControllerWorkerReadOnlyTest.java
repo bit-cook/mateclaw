@@ -36,6 +36,7 @@ class ChatControllerWorkerReadOnlyTest {
     @Mock private MemoryOwnerResolver memoryOwnerResolver;
     @Mock private ChatUploadLocationResolver uploadLocationResolver;
     @Mock private OfficePreviewService officePreviewService;
+    @Mock private ConversationInputQueueStore inputQueue;
     @Mock private Authentication authentication;
 
     private ChatController controller;
@@ -45,7 +46,7 @@ class ChatControllerWorkerReadOnlyTest {
     void setUp() {
         controller = new ChatController(agentService, conversationService, approvalService,
                 streamTracker, objectMapper, completionPublisher, memoryOwnerResolver,
-                uploadLocationResolver, officePreviewService);
+                uploadLocationResolver, officePreviewService, inputQueue);
         ReflectionTestUtils.setField(controller, "turnGate", gate);
     }
 

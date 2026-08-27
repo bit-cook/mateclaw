@@ -10,12 +10,17 @@ import vip.mate.agent.model.AgentEntity;
 import vip.mate.agent.runtime.ConversationTurnGate;
 import vip.mate.approval.ApprovalWorkflowService;
 import vip.mate.channel.web.ChatStreamTracker;
+import vip.mate.channel.web.ConversationInputQueueStore;
 import vip.mate.goal.model.GoalEntity;
+import vip.mate.goal.model.SegmentOutcome;
 import vip.mate.workspace.conversation.ConversationService;
 import vip.mate.workspace.conversation.model.ConversationEntity;
 import vip.mate.workspace.conversation.model.MessageContentPart;
+import vip.mate.workspace.conversation.model.MessageEntity;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -28,9 +33,12 @@ class GoalSegmentRunnerTest {
     ConversationService conversations=mock(ConversationService.class);
     ApprovalWorkflowService approvals=mock(ApprovalWorkflowService.class);
     ChatStreamTracker streams=new ChatStreamTracker(new ObjectMapper());
+    ConversationInputQueueStore inputQueue=mock(ConversationInputQueueStore.class);
+    ConcurrentLinkedQueue<ConversationInputQueueStore.QueuedInput> durableInputs=new ConcurrentLinkedQueue<>();
+    java.util.concurrent.atomic.AtomicLong inputIds=new java.util.concurrent.atomic.AtomicLong();
     ConversationTurnGate gate=new ConversationTurnGate();
     GoalEntity goal=new GoalEntity();
-    GoalSegmentRunner runner=new GoalSegmentRunner(agents,conversations,approvals,streams,new ObjectMapper(),gate);
+    GoalSegmentRunner runner=new GoalSegmentRunner(agents,conversations,approvals,streams,new ObjectMapper(),gate,inputQueue);
 
     @BeforeEach void setup() {
         goal.setId(1L);goal.setConversationId("conv");goal.setAgentId(2L);goal.setWorkspaceId(3L);goal.setCreatedBy("alice");
@@ -39,6 +47,33 @@ class GoalSegmentRunnerTest {
         when(conversations.findByConversationId("conv")).thenReturn(conv);
         AgentEntity agent=new AgentEntity();agent.setEnabled(true);agent.setRuntimeType("native");
         when(agents.getAgent(2L)).thenReturn(agent);
+        when(inputQueue.enqueue(anyString(),anyLong(),anyString(),anyString(),nullable(List.class),any()))
+                .thenAnswer(inv -> {
+                    var now=LocalDateTime.now();
+                    var input=new ConversationInputQueueStore.QueuedInput(inputIds.incrementAndGet(),
+                            inv.getArgument(0),inv.getArgument(1),inv.getArgument(2),inv.getArgument(3),
+                            inv.getArgument(4),"queued",null,null,null,now,now);
+                    durableInputs.add(input);
+                    return input;
+                });
+        when(inputQueue.claimNext(anyString(),anyString(),any())).thenAnswer(inv -> {
+            var input=durableInputs.poll();
+            if(input==null) return java.util.Optional.empty();
+            return java.util.Optional.of(new ConversationInputQueueStore.QueuedInput(input.id(),input.conversationId(),
+                    input.agentId(),input.createdBy(),input.message(),input.contentParts(),"claimed",
+                    inv.getArgument(1),input.persistedMessageId(),null,input.createdAt(),LocalDateTime.now()));
+        });
+        when(inputQueue.bindMessage(anyLong(),anyString(),anyLong(),any())).thenReturn(true);
+        when(inputQueue.consume(anyLong(),anyString(),any())).thenReturn(true);
+        when(inputQueue.release(anyLong(),anyString(),any())).thenReturn(true);
+        when(inputQueue.countQueued(anyString())).thenAnswer(inv -> durableInputs.size());
+        MessageEntity savedUser=new MessageEntity();savedUser.setId(77L);
+        when(conversations.saveMessage(eq("conv"),eq("user"),anyString(),nullable(List.class),eq("queued")))
+                .thenReturn(savedUser);
+    }
+
+    private void enqueue(String message,List<MessageContentPart> parts) {
+        inputQueue.enqueue("conv",2L,"alice",message,parts,LocalDateTime.now());
     }
 
     @Test void persistsStreamedResultAndUsage() {
@@ -73,13 +108,13 @@ class GoalSegmentRunnerTest {
                     boolean autonomous = calls.incrementAndGet()==1;
                     assertTrue(GoalContinuationContext.active());
                     assertEquals(autonomous, GoalContinuationContext.explicitPrompt());
-                    if(autonomous) streams.enqueueMessage("conv","new user instruction",2L,false);
+                    if(autonomous) enqueue("new user instruction",null);
                     return Flux.just(new AgentService.StreamDelta("output",null),
                             AgentService.StreamDelta.event("finish_reason",Map.of("reason","normal")));
                 }));
         runner.run(goal,"continue",false);
         assertEquals(2,calls.get());
-        assertFalse(streams.hasQueuedMessage("conv"));
+        assertEquals(0,inputQueue.countQueued("conv"));
         verify(agents).chatStructuredStream(eq(2L),eq("new user instruction"),eq("conv"),eq("alice"),isNull(),any());
         verify(conversations).saveMessage("conv","user","new user instruction",null,"queued");
     }
@@ -94,7 +129,7 @@ class GoalSegmentRunnerTest {
                             subscribed.countDown();
                         })));
         var failure=new java.util.concurrent.atomic.AtomicReference<Throwable>();
-        var result=new java.util.concurrent.atomic.AtomicReference<GoalSegmentRunner.Result>();
+        var result=new java.util.concurrent.atomic.AtomicReference<SegmentOutcome>();
         Thread worker=Thread.ofVirtual().start(() -> {
             try { result.set(runner.run(goal,"continue",false)); } catch(Throwable error) { failure.set(error); }
         });
@@ -145,12 +180,12 @@ class GoalSegmentRunnerTest {
                 .thenReturn(Flux.<AgentService.StreamDelta>never().doOnSubscribe(s -> ready.countDown()));
         Thread worker = Thread.ofVirtual().start(() -> runner.run(goal,"continue",false));
         assertTrue(ready.await(3,TimeUnit.SECONDS));
-        streams.enqueueMessage("conv","accepted steering",2L,false,parts);
+        enqueue("accepted steering",parts);
         runner.cancelAll();
         worker.join(3000);
         assertFalse(worker.isAlive());
-        verify(conversations).saveMessage("conv","user","accepted steering",parts,"queued");
-        assertFalse(streams.hasQueuedMessage("conv"));
+        verify(conversations,never()).saveMessage("conv","user","accepted steering",parts,"queued");
+        assertEquals(1,inputQueue.countQueued("conv"));
     }
 
     @Test void shutdownRejectsLateWorkerAdmissionWithoutStartingModel() {
@@ -190,12 +225,12 @@ class GoalSegmentRunnerTest {
     @Test void permanentFailurePersistsAcceptedQueuedInput() {
         when(agents.chatStructuredStream(eq(2L),anyString(),eq("conv"),eq("alice"),isNull(),any()))
                 .thenReturn(Flux.defer(() -> {
-                    streams.enqueueMessage("conv","user instruction",2L,false);
+                    enqueue("user instruction",null);
                     return Flux.error(new IllegalArgumentException("bad config"));
                 }));
         assertThrows(IllegalArgumentException.class,()->runner.run(goal,"continue",false));
-        verify(conversations).saveMessage("conv","user","user instruction",null,"queued");
-        assertFalse(streams.hasQueuedMessage("conv"));
+        verify(conversations,never()).saveMessage("conv","user","user instruction",null,"queued");
+        assertEquals(1,inputQueue.countQueued("conv"));
     }
 
     @Test void userSteeringPreservesInterruptedStatusThenRunsQueuedInput() throws Exception {
@@ -211,7 +246,8 @@ class GoalSegmentRunnerTest {
             try { runner.run(goal,"continue",false); } catch(Throwable error) { failure.set(error); }
         });
         assertTrue(subscribed.await(3,java.util.concurrent.TimeUnit.SECONDS));
-        assertTrue(streams.requestInterrupt("conv","new instruction",2L,false));
+        enqueue("new instruction",null);
+        assertTrue(streams.requestInterrupt("conv","",2L,false));
         worker.join(3000);
         assertFalse(worker.isAlive());
         assertNull(failure.get());
@@ -227,7 +263,7 @@ class GoalSegmentRunnerTest {
         when(agents.chatStructuredStream(eq(2L),anyString(),eq("conv"),eq("alice"),isNull(),any()))
                 .thenAnswer(inv -> {
                     if(calls.incrementAndGet()==1) {
-                        streams.enqueueMessage("conv","new question",2L,false);
+                        enqueue("new question",null);
                         return Flux.just(AgentService.StreamDelta.event("finish_reason",Map.of("reason","normal")));
                     }
                     return finish.asMono().flux().doOnSubscribe(s -> entered.countDown());
@@ -251,7 +287,7 @@ class GoalSegmentRunnerTest {
         when(agents.chatStructuredStream(eq(2L),anyString(),eq("conv"),eq("alice"),isNull(),any()))
                 .thenAnswer(inv -> {
                     calls.incrementAndGet();
-                    streams.enqueueMessage("conv","new question",2L,false);
+                    enqueue("new question",null);
                     return Flux.just(AgentService.StreamDelta.event("finish_reason",Map.of("reason","normal")));
                 });
         when(conversations.saveMessage("conv","user","new question",null,"queued")).thenAnswer(inv -> {

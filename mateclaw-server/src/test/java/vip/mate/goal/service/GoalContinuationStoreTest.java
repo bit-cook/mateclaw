@@ -22,7 +22,8 @@ class GoalContinuationStoreTest {
         ds.setURL("jdbc:h2:mem:" + UUID.randomUUID() + ";MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1");
         new ResourceDatabasePopulator(
                 new ClassPathResource("db/migration/h2/V120__agent_goal.sql"),
-                new ClassPathResource("db/migration/h2/V188__goal_continuation.sql")).execute(ds);
+                new ClassPathResource("db/migration/h2/V188__goal_continuation.sql"),
+                new ClassPathResource("db/migration/h2/V189__goal_attempt_and_input_queue.sql")).execute(ds);
         jdbc = new JdbcTemplate(ds);
         store = new GoalContinuationStore(jdbc);
     }
@@ -101,6 +102,8 @@ class GoalContinuationStoreTest {
         goal(1,true,"active");
         var goals=org.mockito.Mockito.mock(GoalService.class);
         var runner=org.mockito.Mockito.mock(GoalSegmentRunner.class);
+        var coordinator=new GoalRunCoordinator(new GoalContinuationStore(jdbc),new GoalAttemptStore(jdbc),goals);
+        var recovery=org.mockito.Mockito.mock(GoalRecoveryService.class);
         var running=new vip.mate.agent.runtime.RunningConversationRegistry();
         var streams=new vip.mate.channel.web.ChatStreamTracker(new com.fasterxml.jackson.databind.ObjectMapper());
         var properties=new vip.mate.goal.config.GoalProperties();
@@ -110,18 +113,19 @@ class GoalContinuationStoreTest {
         entity.setTurnBudget(0);entity.setLlmCallBudget(0);
         org.mockito.Mockito.when(goals.getById(1L)).thenReturn(entity);
         var count=new java.util.concurrent.atomic.AtomicInteger();
-        org.mockito.Mockito.when(runner.run(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.anyString(),org.mockito.ArgumentMatchers.anyBoolean()))
+        org.mockito.Mockito.when(runner.run(org.mockito.ArgumentMatchers.any(GoalRunCoordinator.ClaimedRun.class),org.mockito.ArgumentMatchers.anyString(),org.mockito.ArgumentMatchers.anyBoolean()))
                 .thenAnswer(inv -> {
                     if(count.incrementAndGet()==12) {
                         entity.setStatus(vip.mate.goal.model.GoalStatus.COMPLETED);
                         jdbc.update("UPDATE mate_agent_goal SET status='completed' WHERE id=1");
                     }
-                    return new GoalSegmentRunner.Result("normal",false);
+                    return new vip.mate.goal.model.SegmentOutcome.Continue("normal");
                 });
         for(int i=0;i<15;i++) {
             // Recreate all scheduler state between segments, as after a server restart.
             var scheduler=new GoalContinuationSupervisor(new GoalContinuationStore(jdbc),goals,properties,
                     new GoalFollowupService(properties,new com.fasterxml.jackson.databind.ObjectMapper()),runner,running,streams,
+                    coordinator,recovery,
                     java.time.Clock.fixed(now.plusSeconds(i*5L).toInstant(java.time.ZoneOffset.UTC),java.time.ZoneOffset.UTC),Runnable::run);
             scheduler.tick();
         }

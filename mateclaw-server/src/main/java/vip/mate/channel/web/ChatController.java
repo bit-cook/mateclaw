@@ -44,6 +44,8 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.time.LocalDateTime;
+import java.util.UUID;
 
 /**
  * Web 渠道聊天接口
@@ -67,6 +69,7 @@ public class ChatController {
     private final vip.mate.memory.identity.MemoryOwnerResolver memoryOwnerResolver;
     private final vip.mate.workspace.core.service.ChatUploadLocationResolver uploadLocationResolver;
     private final vip.mate.tool.document.preview.OfficePreviewService officePreviewService;
+    private final ConversationInputQueueStore inputQueue;
 
     @org.springframework.beans.factory.annotation.Autowired
     private ConversationTurnGate turnGate = new ConversationTurnGate();
@@ -299,8 +302,8 @@ public class ChatController {
                                 conversationService.getMessageCount(conversationId)));
                         // deny 是正常 turn 终结，用户可能在 awaiting_approval 阶段排了消息
                         ChatStreamTracker.CompletionResult denyCr = streamTracker.completeAndConsumeIfLast(conversationId);
-                        if (denyCr.allDone() && denyCr.queuedInput() != null) {
-                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, denyCr.queuedInput(), username, requestBaseUrl);
+                        if (denyCr.allDone() && hasQueuedInput(conversationId)) {
+                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, username, requestBaseUrl);
                         } else {
                             completeEmitterQuietly(emitter, approvalEmitterDone);
                         }
@@ -313,8 +316,8 @@ public class ChatController {
                         broadcastEvent(conversationId, "done", Map.of("status", "completed"));
                         // 审批记录被另一个请求消费，但用户可能在等待期间排了消息
                         ChatStreamTracker.CompletionResult consumedNullCr = streamTracker.completeAndConsumeIfLast(conversationId);
-                        if (consumedNullCr.allDone() && consumedNullCr.queuedInput() != null) {
-                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, consumedNullCr.queuedInput(), username, requestBaseUrl);
+                        if (consumedNullCr.allDone() && hasQueuedInput(conversationId)) {
+                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, username, requestBaseUrl);
                         } else {
                             completeEmitterQuietly(emitter, approvalEmitterDone);
                         }
@@ -418,8 +421,8 @@ public class ChatController {
                                 } finally {
                                     ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                                     if (cr.allDone()) {
-                                        if (cr.queuedInput() != null) {
-                                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, cr.queuedInput(), username, requestBaseUrl);
+                                        if (hasQueuedInput(conversationId)) {
+                                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, username, requestBaseUrl);
                                         } else {
                                             conversationService.updateStreamStatus(conversationId, "idle");
                                             completeEmitterQuietly(emitter, approvalEmitterDone);
@@ -519,8 +522,8 @@ public class ChatController {
                                 streamTracker.clearInterruptState(conversationId);
                                 ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                                 if (cr.allDone()) {
-                                    if (cr.queuedInput() != null) {
-                                        startQueuedMessage(conversationId, emitter, approvalEmitterDone, cr.queuedInput(), username, requestBaseUrl);
+                                    if (hasQueuedInput(conversationId)) {
+                                        startQueuedMessage(conversationId, emitter, approvalEmitterDone, username, requestBaseUrl);
                                     } else {
                                         conversationService.updateStreamStatus(conversationId, "idle");
                                         completeEmitterQuietly(emitter, approvalEmitterDone);
@@ -764,7 +767,7 @@ public class ChatController {
                                 ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                                 if (cr.allDone()) {
                                     // RFC follow-up (2026-04-27): the previous guard
-                                    //   cr.queuedInput() != null && (isInterruptFollowup || !wasStopped)
+                                    //   hasQueuedInput(conversationId) && (isInterruptFollowup || !wasStopped)
                                     // dropped legitimate queued messages when the user stopped
                                     // the running turn and then sent a new message via the
                                     // enqueue path (not the interrupt-with-followup path) —
@@ -775,8 +778,8 @@ public class ChatController {
                                     // run it" condition; align with them. If the user
                                     // genuinely doesn't want continuation, no message would
                                     // have been in messageQueue to begin with.
-                                    if (cr.queuedInput() != null) {
-                                        startQueuedMessage(conversationId, emitter, emitterDone, cr.queuedInput(), username, requestBaseUrl);
+                                    if (hasQueuedInput(conversationId)) {
+                                        startQueuedMessage(conversationId, emitter, emitterDone, username, requestBaseUrl);
                                     } else {
                                         conversationService.updateStreamStatus(conversationId, "idle");
                                         // 延迟关闭 emitter，确保最后的事件都已发送
@@ -868,9 +871,9 @@ public class ChatController {
                                 streamTracker.clearInterruptState(conversationId);
                                 ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                                 if (cr.allDone()) {
-                                    if (cr.queuedInput() != null) {
+                                    if (hasQueuedInput(conversationId)) {
                                         // 无论中断类型，都消费排队消息（修复 Disposable 不可用时队列被丢弃的 bug）
-                                        startQueuedMessage(conversationId, emitter, emitterDone, cr.queuedInput(), username, requestBaseUrl);
+                                        startQueuedMessage(conversationId, emitter, emitterDone, username, requestBaseUrl);
                                     } else {
                                         conversationService.updateStreamStatus(conversationId, "idle");
                                         completeEmitterQuietly(emitter, emitterDone);
@@ -978,7 +981,7 @@ public class ChatController {
                             streamTracker.clearInterruptState(conversationId);
                             ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                             log.info("SSE doOnError cleanup: conversationId={}, allDone={}, isInterruptFollowup={}, hasQueued={}",
-                                    conversationId, cr.allDone(), isInterruptFollowup, cr.queuedInput() != null);
+                                    conversationId, cr.allDone(), isInterruptFollowup, hasQueuedInput(conversationId));
                             if (cr.allDone()) {
                                 // RFC follow-up (2026-04-27): the previous guard
                                 //   cr.queuedInput()!=null && !(isUserStop && !isInterruptFollowup)
@@ -992,8 +995,8 @@ public class ChatController {
                                 // follow-up. Whoever puts a message in messageQueue means it
                                 // — just run it. Aligns with doOnComplete and the 4 other
                                 // queue-launch sites in this controller.
-                                if (cr.queuedInput() != null) {
-                                    startQueuedMessage(conversationId, emitter, emitterDone, cr.queuedInput(), username, requestBaseUrl);
+                                if (hasQueuedInput(conversationId)) {
+                                    startQueuedMessage(conversationId, emitter, emitterDone, username, requestBaseUrl);
                                 } else {
                                     conversationService.updateStreamStatus(conversationId, "idle");
                                     completeEmitterQuietly(emitter, emitterDone);
@@ -1108,17 +1111,24 @@ public class ChatController {
         // 判断当前阶段（仅用于 reason 字段，行为对所有阶段一致：仅入队）
         boolean isAwaitingApproval = approvalService.findPendingByConversation(conversationId) != null;
 
-        // 仅入队、不 dispose。延迟持久化到 startQueuedMessage（让 Asst-N 先在 doOnComplete 落库，
-        // 否则 listMessages ORDER BY create_time ASC 会把 Q(N+1) 排到 Asst-N 前面）
-        boolean queued = streamTracker.enqueueMessage(conversationId, message, agentId, false, contentParts);
+        // Commit the payload before publishing acceptance. The stream tracker is
+        // only a wake signal; the database row remains authoritative on restart.
+        var stored = inputQueue.enqueue(conversationId, agentId, username, message, contentParts,
+                LocalDateTime.now());
+        boolean queued = streamTracker.notifyQueuedInput(conversationId);
+        if (!queued) {
+            inputQueue.cancel(stored.id(), "stream_finished_before_queue_registration",
+                    LocalDateTime.now());
+        }
         log.info("Enqueued follow-up message during running turn: conversationId={}, user={}, queueSize={}, awaitingApproval={}",
-                conversationId, username, streamTracker.getQueueSize(conversationId), isAwaitingApproval);
+                conversationId, username, inputQueue.countQueued(conversationId), isAwaitingApproval);
 
         return R.ok(Map.of(
                 "interrupted", false,
                 "queued", queued,
-                "queueSize", streamTracker.getQueueSize(conversationId),
-                "reason", isAwaitingApproval ? "awaiting_approval" : "queued"
+                "queueItemId", stored.id().toString(),
+                "queueSize", inputQueue.countQueued(conversationId),
+                "reason", queued ? (isAwaitingApproval ? "awaiting_approval" : "queued") : "no_active_stream"
         ));
     }
 
@@ -1424,16 +1434,25 @@ public class ChatController {
         private Boolean regenerate;
     }
 
-    /**
-     * 自动启动排队消息（interrupt-with-followup 或自然完成后的续跑逻辑）。
-     * 接受由 {@link ChatStreamTracker#completeAndConsumeIfLast} 预先消费的 QueuedInput 快照。
-     * 快照已脱离 RunState 生命周期，不受后续 complete/register 影响。
-     * 支持链式续跑：queued stream 自身完成时也通过 completeAndConsumeIfLast 检查并递归调用。
-     */
+    /** Claims and starts the next durable input after the current stream finishes. */
     private void startQueuedMessage(String conversationId, SseEmitter emitter, AtomicBoolean emitterDone,
-                                    ChatStreamTracker.QueuedInput preConsumedInput, String requesterId,
-                                    String baseUrl) {
+                                    String requesterId, String baseUrl) {
+        String queueClaimId = UUID.randomUUID().toString();
+        ConversationInputQueueStore.QueuedInput preConsumedInput = inputQueue
+                .claimNext(conversationId, queueClaimId, LocalDateTime.now())
+                .orElse(null);
         if (preConsumedInput == null) {
+            conversationService.updateStreamStatus(conversationId, "idle");
+            completeEmitterQuietly(emitter, emitterDone);
+            return;
+        }
+
+        Long agentId = preConsumedInput.agentId() != null ? preConsumedInput.agentId() : 1L;
+        var queuedConversation = conversationService.findByConversationId(conversationId);
+        if (queuedConversation == null || !agentId.equals(queuedConversation.getAgentId())) {
+            inputQueue.release(preConsumedInput.id(), queueClaimId, LocalDateTime.now());
+            broadcastEvent(conversationId, "warning", Map.of(
+                    "message", "排队消息对应的助手已变化，请确认后重试"));
             conversationService.updateStreamStatus(conversationId, "idle");
             completeEmitterQuietly(emitter, emitterDone);
             return;
@@ -1446,11 +1465,14 @@ public class ChatController {
                 || lastMessage.contains("429") || lastMessage.contains("速率限制"))) {
             log.warn("Skipping queued message after rate limit error: conversationId={}, lastMessage={}",
                     conversationId, lastMessage.substring(0, Math.min(50, lastMessage.length())));
-            // 持久化用户消息不丢失
-            if (preConsumedInput.message() != null && !preConsumedInput.message().isBlank()
-                    && !preConsumedInput.persisted()) {
-                conversationService.saveMessage(conversationId, "user", preConsumedInput.message());
+            if (preConsumedInput.persistedMessageId() == null) {
+                MessageEntity saved = conversationService.saveMessage(conversationId, "user",
+                        preConsumedInput.message(), preConsumedInput.contentParts(), "queued");
+                if (saved != null) {
+                    inputQueue.bindMessage(preConsumedInput.id(), queueClaimId, saved.getId(), LocalDateTime.now());
+                }
             }
+            inputQueue.consume(preConsumedInput.id(), queueClaimId, LocalDateTime.now());
             broadcastEvent(conversationId, "warning", Map.of(
                     "message", "上一轮请求触发了频率限制，排队消息已保存，请稍后重新发送"));
             broadcastEvent(conversationId, "done", Map.of("status", "rate_limited"));
@@ -1460,18 +1482,26 @@ public class ChatController {
         }
 
         String queuedMessage = preConsumedInput.message();
-        Long agentId = preConsumedInput.agentId() != null ? preConsumedInput.agentId() : 1L;
         log.info("Starting queued message: conversationId={}, agentId={}, message={}",
-                conversationId, agentId, queuedMessage.substring(0, Math.min(30, queuedMessage.length())));
+                conversationId, agentId, queuedMessage == null ? "" : queuedMessage.substring(0, Math.min(30, queuedMessage.length())));
 
         // 持久化排队的用户消息（含 contentParts；幂等：如果 /interrupt 已提前持久化则跳过）。
         // 这里持久化是为了确保 user 消息在 assistant 消息（doOnError/doOnCancel 已写入）之后落库，
         // 让 listMessages ORDER BY create_time ASC 后顺序正确：Q1 → Asst1 → Q2 → Asst2。
-        Long queuedOriginMessageId = null;
-        if (queuedMessage != null && !queuedMessage.isBlank() && !preConsumedInput.persisted()) {
+        Long queuedOriginMessageId = preConsumedInput.persistedMessageId();
+        if (queuedOriginMessageId == null) {
             MessageEntity savedUser = conversationService.saveMessage(conversationId, "user", queuedMessage,
                     preConsumedInput.contentParts(), "queued");
             queuedOriginMessageId = savedUser == null ? null : savedUser.getId();
+            if (queuedOriginMessageId == null
+                    || !inputQueue.bindMessage(preConsumedInput.id(), queueClaimId,
+                    queuedOriginMessageId, LocalDateTime.now())) {
+                inputQueue.release(preConsumedInput.id(), queueClaimId, LocalDateTime.now());
+                throw new IllegalStateException("Queued input could not be bound to its persisted message");
+            }
+        }
+        if (!inputQueue.consume(preConsumedInput.id(), queueClaimId, LocalDateTime.now())) {
+            throw new IllegalStateException("Queued input claim was lost before execution");
         }
 
         // 广播 queued_input_started 事件
@@ -1558,9 +1588,9 @@ public class ChatController {
                     } finally {
                         ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                         if (cr.allDone()) {
-                            if (cr.queuedInput() != null) {
+                            if (hasQueuedInput(conversationId)) {
                                 // 链式续跑：queued stream 期间又排了新消息
-                                startQueuedMessage(conversationId, emitter, emitterDone, cr.queuedInput(), requesterId, baseUrl);
+                                startQueuedMessage(conversationId, emitter, emitterDone, requesterId, baseUrl);
                             } else {
                                 conversationService.updateStreamStatus(conversationId, "idle");
                                 sseExecutor.execute(() -> {
@@ -1604,8 +1634,8 @@ public class ChatController {
                     }
                     ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                     if (cr.allDone()) {
-                        if (cr.queuedInput() != null) {
-                            startQueuedMessage(conversationId, emitter, emitterDone, cr.queuedInput(), requesterId, baseUrl);
+                        if (hasQueuedInput(conversationId)) {
+                            startQueuedMessage(conversationId, emitter, emitterDone, requesterId, baseUrl);
                         } else {
                             conversationService.updateStreamStatus(conversationId, "idle");
                             completeEmitterQuietly(emitter, emitterDone);
@@ -1616,6 +1646,10 @@ public class ChatController {
         streamTracker.setDisposable(conversationId, disposable);
         streamTracker.setEmergencySaveCallback(conversationId,
                 () -> emergencySaveAccumulator(conversationId, accumulator));
+    }
+
+    private boolean hasQueuedInput(String conversationId) {
+        return inputQueue.countQueued(conversationId) > 0;
     }
 
     /**
